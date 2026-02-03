@@ -80,9 +80,13 @@ To ensure the model learns to scan the entire runway rather than just "looking i
 * **Importance:** This ensures that the YOLO model learns to detect debris regardless of its lateral or vertical position on the asphalt.
 
 **🛠️ Key EDA Conclusions**  
-* **Metric Alignment:** The high correlation in aspect ratios suggests that anchor box optimization in YOLO will be straightforward and effective.
-* **Dataset Integrity:** The automated pipeline successfully avoided "Label Errors" (like missing annotations or misaligned boxes), which is a common failure point in manual labeling.
-* **Realism Check:** The overlap in object sizes across classes ensures the model learns the features of the hazard rather than just its size.
+* **Spatial Integrity:** The heatmap confirms that the procedural pipeline provides enough spatial variance to prevent the model from "cheating" by only looking in fixed locations.
+
+* **Metric Alignment:** The tight 1:1 aspect ratio correlation suggests that standard YOLO anchor box optimization will be highly effective for this dataset.
+
+* **Label Precision:** The automated generation pipeline successfully bypassed the "Label Noise" common in manual datasets, providing pixel-perfect bounding box ground truths.
+
+* **Feature-First Learning:** The overlap in object sizes across all three classes ensures the model prioritizes learning material textures (like jagged ice vs. dark oil) rather than just identifying objects based on their size.
 
 
 ## <a id="augmentations"></a>🛠️ Data Augmentations
