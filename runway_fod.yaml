@@ -1,5 +1,3 @@
-# Use absolute path (run 'pwd' in the new dataset folder to get this)
-# Example: /home/yuri/projects/runway_fod_project/dataset/runway_dataset
 path: dataset/runway_dataset
 
 train: images/train
