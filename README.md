@@ -71,6 +71,7 @@ The EDA focused on two primary metrics: Class Frequency and Spatial Scale.
 
 **🗺️ Spatial Density Analysis**  
 To ensure the model learns to scan the entire runway rather than just "looking in the middle," we analyzed the center-point locations of all generated objects.
+
 <img src="README_materials/EDA2.png" width="500" alt="Bounding Box Center Location Heatmap">
 
 * **Spatial Distribution:** The heatmap reveals a high-variance "cloud" of object placements across the center and intermediate zones of the runway.
