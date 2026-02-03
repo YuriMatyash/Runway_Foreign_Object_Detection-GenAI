@@ -98,6 +98,18 @@ def train_model():
         imgsz=640,
         batch=16,
         
+        # --- NEW: DATA AUGMENTATIONS ---
+        mosaic=1.0,      # Combine 4 images into 1 (helps small object detection)
+        mixup=0.1,       # Blends two images to increase robustness
+        degrees=15.0,    # Random rotation +/- 15 degrees (runway orientation variance)
+        translate=0.1,   # Translation +/- 10% (camera centering variance)
+        scale=0.5,       # Scale +/- 50% (simulates different flight altitudes)
+        flipud=0.5,      # Vertical flip (top-down views are orientation-agnostic)
+        fliplr=0.5,      # Horizontal flip
+        hsv_h=0.015,     # Hue jitter (simulates varying light temperature)
+        hsv_s=0.7,       # Saturation jitter
+        hsv_v=0.4,       # Brightness jitter (harsh sun vs. overcast)
+
         # Speed & Stability
         device=0,
         workers=8,
