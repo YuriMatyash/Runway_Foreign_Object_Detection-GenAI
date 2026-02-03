@@ -6,7 +6,7 @@ from tqdm import tqdm  # pip install tqdm if you don't have it, or remove this
 
 # --- CONFIGURATION ---
 # Where your raw mixed files are currently
-SOURCE_DIR = Path("dataset/MFS/processed") 
+SOURCE_DIR = Path("main/results")
 
 # Where we want the clean YOLO structure
 DEST_DIR = Path("dataset/runway_dataset")

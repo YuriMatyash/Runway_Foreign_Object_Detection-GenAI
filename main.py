@@ -91,7 +91,7 @@ def train_model():
     results = model.train(
         data=hp.YOLO_DATA_FILE,
         project='runway_project',
-        name='train_run',
+        name='train_run_2',
         
         # Hyperparams
         epochs=hp.EPOCHS,

@@ -3,210 +3,196 @@ import cv2
 import torch
 import random
 import numpy as np
-from PIL import Image, ImageFilter
-from diffusers import StableDiffusionXLImg2ImgPipeline
+from PIL import Image, ImageDraw
+from diffusers import StableDiffusionXLImg2ImgPipeline, AutoencoderKL
 
 # ==========================================
 #               CONFIGURATION
 # ==========================================
 
-OUTPUT_DIR = "./main/results"                    # Final dir
+OUTPUT_DIR = "./main/results"                    # Final dataset directory
 OUTPUT_FILENAME_PREFIX = 'oil'
-NUM_IMAGES = 299
+NUM_IMAGES = 200                                 # Total images to generate
 
-YOLO_LABEL_INDEX = 0 
+YOLO_LABEL_INDEX = 0                             # Class ID for oil
 
-# OIL PROMPT
 PROMPT = (
-    "raw photograph, satellite view of asphalt airport runway surface, "
-    "heavy grain texture, dirt, weathered concrete, black oil puddle, "
-    "detailed ground texture, daylight"
+    "raw aerial photograph, ultra-realistic satellite view of a weathered asphalt airport runway, "
+    "bordered by lush green grass or deep brown dirt, realistic soil texture, "
+    "granular heavy grain texture, tire skid marks, oil stains, deep black puddle, "
+    "sharp focus, harsh daylight"
 )
 
-NEGATIVE_PROMPT = "smooth, digital painting, cartoon, drawing, 3d render, blur, low res, clean"
+# UPDATED NEGATIVE PROMPT: Explicitly banning vehicles and aircraft
+NEGATIVE_PROMPT = (
+    "planes, aircraft, airplanes, vehicles, cars, trucks, buses, "
+    "bluish grass, blue dirt, smooth, digital painting, cartoon, "
+    "drawing, 3d render, blur, low res, clean, plastic"
+)
 
 AI_STRENGTH = 0.55
-
+IMG_SIZE = 1024
+# ==========================================
+#              HELPER FUNCTIONS
 # ==========================================
 
 def ensure_dir(d):
     if not os.path.exists(d): os.makedirs(d)
 
 def add_noise_and_blur(img_cv):
-    """ Adds grit to the perfect OpenCV drawing so AI doesn't make it cartoonish. """
-    # 1. Slight Blur to soften razor-sharp computer edges
+    """ Adds grit to the OpenCV drawing so AI doesn't make it cartoonish. """
     img_blurred = cv2.GaussianBlur(img_cv, (3, 3), 0)
-    
-    # 2. Add random noise grain
-    noise = np.random.randint(0, 50, img_blurred.shape, dtype='uint8')
-    # Blend noise into image (add grain texture)
-    img_noisy = cv2.addWeighted(img_blurred, 0.8, noise, 0.2, 0)
-    
+    noise = np.random.randint(0, 45, img_blurred.shape, dtype='uint8')
+    img_noisy = cv2.addWeighted(img_blurred, 0.85, noise, 0.15, 0)
     return img_noisy
 
-# ==========================================
-#        NEW BOUNDING BOX FUNCTIONS
-# ==========================================
-
 def get_ellipse_bbox(center, axes, angle):
-    """
-    Calculates the axis-aligned bounding box for a rotated ellipse.
-    center: (cx, cy)
-    axes: (width_radius, height_radius) -> Note: OpenCV uses (width/2, height/2) roughly
-    angle: rotation angle in degrees
-    """
+    """ Calculates the axis-aligned bounding box for a rotated ellipse. """
     cx, cy = center
-    a, b = axes # Semi-axes
+    a, b = axes 
     theta = np.radians(angle)
-
-    # Parametric equation calculation for BBox extent
-    # Width extent (x)
-    ux = a * np.cos(theta)
-    vx = b * np.sin(theta)
-    bbox_halfwidth = np.sqrt(ux*ux + vx*vx)
+    ux, vx = a * np.cos(theta), b * np.sin(theta)
+    uy, vy = a * np.sin(theta), b * np.cos(theta)
     
-    # Height extent (y)
-    uy = a * np.sin(theta)
-    vy = b * np.cos(theta)
-    bbox_halfheight = np.sqrt(uy*uy + vy*vy)
+    # Calculate extents based on parametric equations
+    width_ext = np.sqrt(ux**2 + vx**2)
+    height_ext = np.sqrt(uy**2 + vy**2)
 
-    min_x = cx - bbox_halfwidth
-    max_x = cx + bbox_halfwidth
-    min_y = cy - bbox_halfheight
-    max_y = cy + bbox_halfheight
-
-    return (min_x, min_y, max_x, max_y)
+    return (cx - width_ext, cy - height_ext, cx + width_ext, cy + height_ext)
 
 def save_yolo_label(path, bbox, img_w, img_h, class_id):
-    """
-    Saves a .txt file with YOLO format: class_id center_x center_y width height
-    All coordinates are normalized (0 to 1).
-    """
+    """ Saves a .txt file with normalized YOLO format. """
     min_x, min_y, max_x, max_y = bbox
-    
-    # Calculate center and width/height
-    w = max_x - min_x
-    h = max_y - min_y
+    w, h = max_x - min_x, max_y - min_y
     center_x = min_x + (w / 2)
     center_y = min_y + (h / 2)
     
-    # Normalize
-    norm_cx = center_x / img_w
-    norm_cy = center_y / img_h
-    norm_w = w / img_w
-    norm_h = h / img_h
-    
-    # Clamp values to 0-1 just in case
-    norm_cx = min(max(norm_cx, 0), 1)
-    norm_cy = min(max(norm_cy, 0), 1)
-    norm_w = min(max(norm_w, 0), 1)
-    norm_h = min(max(norm_h, 0), 1)
+    # Normalize and clamp to [0, 1]
+    norm_cx = min(max(center_x / img_w, 0), 1)
+    norm_cy = min(max(center_y / img_h, 0), 1)
+    norm_w = min(max(w / img_w, 0), 1)
+    norm_h = min(max(h / img_h, 0), 1)
     
     line = f"{class_id} {norm_cx:.6f} {norm_cy:.6f} {norm_w:.6f} {norm_h:.6f}\n"
-    
     with open(path, 'w') as f:
         f.write(line)
 
 # ==========================================
+#            VARIATION LOGIC
+# ==========================================
 
-def create_base_layout(w=512, h=512):
-    # 1. Base Asphalt (Slightly varied grey)
-    base_color = random.randint(70, 90)
-    img = np.full((h, w, 3), (base_color, base_color, base_color), dtype=np.uint8)
+def draw_burnt_rubber(img, w, h, left_bound, right_bound):
+    """ Simulates tire skid marks within the asphalt boundaries. """
+    overlay = img.copy()
+    num_skids = random.randint(5, 15)
+    for _ in range(num_skids):
+        start_x = random.randint(left_bound, right_bound)
+        end_x = start_x + random.randint(-20, 20)
+        cv2.line(overlay, (start_x, 0), (end_x, h), (10, 10, 10), random.randint(2, 8))
+    return cv2.addWeighted(img, 0.7, overlay, 0.3, 0)
+
+def create_base_layout(w=1024, h=1024):
+    """ Generates a randomized runway layout with shoulders and markings. """
+    # 1. Determine Shoulder Widths (5-15% on each side)
+    left_perc = random.uniform(0.05, 0.15)
+    right_perc = random.uniform(0.05, 0.15)
+    left_bound = int(w * left_perc)
+    right_bound = int(w * (1.0 - right_perc))
     
-    # 2. Draw Runway Markings (Off-White, not pure white)
-    mark_color = (210, 210, 210)
-    bar_width = w // 15
-    bar_height = h // 10
-    spacing = w // 20
+    # 2. Base Asphalt
+    base_val = random.randint(50, 90)
+    img_base = np.full((h, w, 3), (base_val, base_val, base_val), dtype=np.uint8)
     
-    # Threshold bars
-    start_x = spacing
-    for i in range(4):
-        cv2.rectangle(img, (start_x, h - bar_height), (start_x + bar_width, h), mark_color, -1)
-        end_x = w - start_x - bar_width
-        cv2.rectangle(img, (end_x, h - bar_height), (end_x + bar_width, h), mark_color, -1)
-        start_x += bar_width + spacing
+    # 3. Randomized Shoulder Color (Green or Earthy Brown)
+    if random.random() > 0.5:
+        shoulder_color = (random.randint(30, 60), random.randint(70, 100), random.randint(20, 40))
+    else:
+        shoulder_color = (random.randint(80, 120), random.randint(70, 100), random.randint(30, 60))
+        
+    cv2.rectangle(img_base, (0, 0), (left_bound, h), shoulder_color, -1)
+    cv2.rectangle(img_base, (right_bound, 0), (w, h), shoulder_color, -1)
+    
+    # 4. Randomized Markings
+    mark_type = random.choice(['white', 'yellow', 'none'])
+    if mark_type != 'none':
+        if mark_type == 'white': mark_color = (random.randint(200, 230),)*3
+        else: mark_color = (random.randint(180, 210), random.randint(160, 190), 30)
+        
+        dash_w, dash_h = int(w * 0.03), int(h * 0.15)
+        asphalt_center = left_bound + (right_bound - left_bound) // 2
+        
+        if random.random() > 0.5: # Centerline
+            cv2.rectangle(img_base, (asphalt_center - dash_w//2, int(h*0.1)), (asphalt_center + dash_w//2, int(h*0.1)+dash_h), mark_color, -1)
+            cv2.rectangle(img_base, (asphalt_center - dash_w//2, int(h*0.7)), (asphalt_center + dash_w//2, int(h*0.7)+dash_h), mark_color, -1)
+        else: # Side Line near shoulder
+            cv2.line(img_base, (left_bound + int(w*0.02), 0), (left_bound + int(w*0.02), h), mark_color, int(w*0.01))
 
-    # Centerline
-    dash_h = h // 8
-    dash_w = w // 40
-    curr_y = 0
-    while curr_y < h - bar_height - spacing:
-        cv2.rectangle(img, (w//2 - dash_w//2, curr_y), (w//2 + dash_w//2, curr_y + dash_h), mark_color, -1)
-        curr_y += dash_h * 2
+    # 5. Tire Skids
+    img_base = draw_burnt_rubber(img_base, w, h, left_bound, right_bound)
 
-    # 3. Draw Oil Blob (Pure Black)
-    # Note: cv2.ellipse takes axes as (half_width, half_height)
-    blob_w = random.randint(w//8, w//4)
-    blob_h = random.randint(h//8, h//4)
-    center_x = random.randint(w//3, 2*w//3)
-    center_y = random.randint(h//3, 2*h//3)
+    # 6. Oil Blob
+    blob_w, blob_h = random.randint(w//12, w//8), random.randint(h//12, h//8)
+    center_x = random.randint(left_bound + blob_w, right_bound - blob_w)
+    center_y = random.randint(h//4, 3*h//4)
     angle = random.randint(0, 180)
     
-    cv2.ellipse(img, (center_x, center_y), (blob_w, blob_h), angle, 0, 360, (5, 5, 5), -1)
+    puddle_color = (random.randint(5, 15), random.randint(5, 15), random.randint(5, 15))
+    cv2.ellipse(img_base, (center_x, center_y), (blob_w, blob_h), angle, 0, 360, puddle_color, -1)
     
-    # Calculate BBox for the ellipse
     bbox = get_ellipse_bbox((center_x, center_y), (blob_w, blob_h), angle)
+    img_gritty = add_noise_and_blur(img_base)
     
-    # --- NEW STEP: Add realism noise before AI sees it ---
-    img_gritty = add_noise_and_blur(img)
-    
-    # Return both image and bbox
     return Image.fromarray(cv2.cvtColor(img_gritty, cv2.COLOR_BGR2RGB)), bbox
+
+# ==========================================
 
 def main():
     ensure_dir(OUTPUT_DIR)
     
-    print("⏳ Loading Stable Diffusion XL Img2Img...")
-    # UPDATED: Using SDXL Base 1.0
+    print("⏳ Loading SDXL and Stable VAE...")
+    # Use Stable VAE fix for FP16 stability
+    vae = AutoencoderKL.from_pretrained("madebyollin/sdxl-vae-fp16-fix", torch_dtype=torch.float16)
     pipe = StableDiffusionXLImg2ImgPipeline.from_pretrained(
         "stabilityai/stable-diffusion-xl-base-1.0",
+        vae=vae,
         torch_dtype=torch.float16,
         variant="fp16",
         use_safetensors=True
     ).to("cuda")
     
-    # Disable safety checker mostly handled by bypassing or setting to None if attribute exists
-    # Standard SDXL pipe usually doesn't have the same safety_checker attribute exposed by default like v1.5
-    # but we proceed with standard loading.
+    # Optimizations for performance
+    pipe.enable_model_cpu_offload() 
+    pipe.enable_attention_slicing()
 
-    print(f"✅ Model Loaded. Applying photorealistic texture (Strength: {AI_STRENGTH})...")
-    print(f"generating {NUM_IMAGES} images.")
+    print(f"✅ Ready. Generating {NUM_IMAGES} images with variety...")
 
     for i in range(NUM_IMAGES):
         print(f"[{i+1}/{NUM_IMAGES}] Generative Step...")
         
-        # Get image and bbox
-        base_image, bbox = create_base_layout(512, 512)
+        # Get randomized base and bbox
+        base_image, bbox = create_base_layout(IMG_SIZE, IMG_SIZE)
         
-        with torch.autocast("cuda"):
+        with torch.inference_mode(), torch.autocast("cuda"):
             final_image = pipe(
                 prompt=PROMPT,
                 negative_prompt=NEGATIVE_PROMPT,
                 image=base_image,
                 strength=AI_STRENGTH,
-                num_inference_steps=40,
-                guidance_scale=8.0
+                num_inference_steps=35,
+                guidance_scale=13.0               # Higher for prompt adherence
             ).images[0]
 
         filename_base = f"{OUTPUT_FILENAME_PREFIX}_{i+1:03d}"
-        img_filename = f"{filename_base}.png"
-        txt_filename = f"{filename_base}.txt"
+        save_path_img = os.path.join(OUTPUT_DIR, f"{filename_base}.png")
+        save_path_txt = os.path.join(OUTPUT_DIR, f"{filename_base}.txt")
         
-        save_path_img = os.path.join(OUTPUT_DIR, img_filename)
-        save_path_txt = os.path.join(OUTPUT_DIR, txt_filename)
-        
+        # Save results
         final_image.save(save_path_img)
+        save_yolo_label(save_path_txt, bbox, IMG_SIZE, IMG_SIZE, YOLO_LABEL_INDEX)
         
-        # Save Label
-        width, height = final_image.size
-        save_yolo_label(save_path_txt, bbox, width, height, YOLO_LABEL_INDEX)
+        print(f"Saved: {filename_base}")
         
-        print(f"Saved Image: {save_path_img}")
-        print(f"Saved Label: {save_path_txt}")
-        
-    print(f"Done")
+    print(f"✅ Done. Dataset ready in {OUTPUT_DIR}")
 
 if __name__ == "__main__":
     main()

@@ -4,222 +4,194 @@ import torch
 import random
 import numpy as np
 import math
-from PIL import Image, ImageFilter
-from diffusers import StableDiffusionXLImg2ImgPipeline
+from PIL import Image, ImageDraw
+from diffusers import StableDiffusionXLImg2ImgPipeline, AutoencoderKL
 
 # ==========================================
 #               CONFIGURATION
 # ==========================================
 
-OUTPUT_DIR = "./dataset/raw/hole"
+OUTPUT_DIR = "./dataset/raw/hole"                 # Final dataset directory
 OUTPUT_FILENAME_PREFIX = 'hole'
-NUM_IMAGES = 200
+NUM_IMAGES = 3                                 # Total images to generate
 
-YOLO_LABEL_INDEX = 2  # The class number for the hole
+YOLO_LABEL_INDEX = 2                             # Class ID for the hole
 
-# HOLE PROMPT
+# HOLE PROMPT: Focuses on soil granularity and debris
 PROMPT = (
-    "raw photograph, satellite view of asphalt airport runway surface, "
-    "large jagged pothole, missing chunk of asphalt, exposed brown dirt inside hole, "
-    "rubble, cracked pavement edges, heavy grain texture, weathered concrete, daylight"
+    "raw aerial photograph, ultra-realistic satellite view of a weathered asphalt airport runway, "
+    "bordered by lush green grass and dry brown dirt, "
+    "a jagged deep pothole in the asphalt, exposed realistic brown soil and dirt inside, "
+    "loose rubble and stones, granular earth texture, cracked pavement edges, "
+    "tire skid marks, sharp focus, harsh daylight"
 )
 
-NEGATIVE_PROMPT = "smooth, digital painting, cartoon, drawing, 3d render, blur, low res, clean, water, liquid, reflection"
+NEGATIVE_PROMPT = (
+    "planes, aircraft, airplanes, vehicles, cars, trucks, buses, "
+    "smooth brown blob, flat color, solid paint, blue tint, blue borders, "
+    "digital painting, cartoon, drawing, 3d render, blur, low res, clean"
+)
 
-# Keep strength high to allow AI to texture the dirt properly
-AI_STRENGTH = 0.55
+AI_STRENGTH = 0.65 # Higher strength allows AI to replace flat brown with textured soil
+IMG_SIZE = 1024    # SDXL native resolution
 
+# ==========================================
+#              HELPER FUNCTIONS
 # ==========================================
 
 def ensure_dir(d):
     if not os.path.exists(d): os.makedirs(d)
 
 def add_noise_and_blur(img_cv):
-    """ Adds grit to the perfect OpenCV drawing so AI doesn't make it cartoonish. """
+    """ Adds grit to the OpenCV drawing so AI doesn't make it cartoonish. """
     img_blurred = cv2.GaussianBlur(img_cv, (3, 3), 0)
-    noise = np.random.randint(0, 50, img_blurred.shape, dtype='uint8')
-    img_noisy = cv2.addWeighted(img_blurred, 0.8, noise, 0.2, 0)
+    noise = np.random.randint(0, 45, img_blurred.shape, dtype='uint8')
+    img_noisy = cv2.addWeighted(img_blurred, 0.85, noise, 0.15, 0)
     return img_noisy
 
-# ==========================================
-#        NEW BOUNDING BOX FUNCTIONS
-# ==========================================
+def add_dirt_texture(img, pts):
+    """ Adds specific high-frequency noise to the hole area to simulate soil grains. """
+    mask = np.zeros(img.shape[:2], dtype=np.uint8)
+    cv2.fillPoly(mask, [pts], 255)
+    
+    # Generate granular noise
+    noise = np.random.randint(0, 100, img.shape, dtype='uint8')
+    # Apply noise only to the hole area
+    img_textured = cv2.addWeighted(img, 0.7, noise, 0.3, 0)
+    img[mask > 0] = img_textured[mask > 0]
+    return img
 
-def get_bounding_box(pts):
-    """
-    Calculates the axis-aligned bounding box from a list of polygon points.
-    Returns: (min_x, min_y, max_x, max_y)
-    """
-    # pts shape is (N, 1, 2)
-    x_coords = pts[:, 0, 0]
-    y_coords = pts[:, 0, 1]
-    
-    min_x = np.min(x_coords)
-    max_x = np.max(x_coords)
-    min_y = np.min(y_coords)
-    max_y = np.max(y_coords)
-    
-    return (min_x, min_y, max_x, max_y)
+def get_polygon_bbox(pts):
+    """ Calculates the axis-aligned bounding box from polygon points. """
+    x_coords = pts[:, 0]
+    y_coords = pts[:, 1]
+    return (np.min(x_coords), np.min(y_coords), np.max(x_coords), np.max(y_coords))
 
 def save_yolo_label(path, bbox, img_w, img_h, class_id):
-    """
-    Saves a .txt file with YOLO format: class_id center_x center_y width height
-    All coordinates are normalized (0 to 1).
-    """
+    """ Saves a .txt file with normalized YOLO format. """
     min_x, min_y, max_x, max_y = bbox
-    
-    # Calculate center and width/height
-    w = max_x - min_x
-    h = max_y - min_y
+    w, h = max_x - min_x, max_y - min_y
     center_x = min_x + (w / 2)
     center_y = min_y + (h / 2)
     
-    # Normalize
-    norm_cx = center_x / img_w
-    norm_cy = center_y / img_h
-    norm_w = w / img_w
-    norm_h = h / img_h
-    
-    # Clamp values to 0-1 just in case
-    norm_cx = min(max(norm_cx, 0), 1)
-    norm_cy = min(max(norm_cy, 0), 1)
-    norm_w = min(max(norm_w, 0), 1)
-    norm_h = min(max(norm_h, 0), 1)
+    norm_cx = min(max(center_x / img_w, 0), 1)
+    norm_cy = min(max(center_y / img_h, 0), 1)
+    norm_w = min(max(w / img_w, 0), 1)
+    norm_h = min(max(h / img_h, 0), 1)
     
     line = f"{class_id} {norm_cx:.6f} {norm_cy:.6f} {norm_w:.6f} {norm_h:.6f}\n"
-    
     with open(path, 'w') as f:
         f.write(line)
 
 # ==========================================
+#            VARIATION LOGIC
+# ==========================================
 
-def draw_jagged_hole(img, center_x, center_y, base_radius):
-    """ 
-    Draws an irregular, jagged polygon filled with brown to simulate 
-    a broken chunk of asphalt exposing dirt.
-    Returns the bounding box of the drawn hole.
-    """
-    num_points = 12 # Number of vertices in the hole
+def draw_burnt_rubber(img, w, h, left_bound, right_bound):
+    """ Simulates tire skid marks within the asphalt boundaries. """
+    overlay = img.copy()
+    num_skids = random.randint(5, 15)
+    for _ in range(num_skids):
+        start_x = random.randint(left_bound, right_bound)
+        end_x = start_x + random.randint(-20, 20)
+        cv2.line(overlay, (start_x, 0), (end_x, h), (10, 10, 10), random.randint(2, 8))
+    return cv2.addWeighted(img, 0.7, overlay, 0.3, 0)
+
+def draw_jagged_hole(img, left_bound, right_bound, h):
+    """ Draws a jagged pothole filled with textured dirt. """
+    base_radius = random.randint(60, 110)
+    center_x = random.randint(left_bound + base_radius, right_bound - base_radius)
+    center_y = random.randint(int(h * 0.3), int(h * 0.7))
+    
+    num_points = 12 
     points = []
-
     for i in range(num_points):
-        # Calculate angle
         angle = (2 * math.pi * i) / num_points
-        # Randomize radius to make it jagged (0.7x to 1.3x variance)
-        r = base_radius * random.uniform(0.7, 1.4)
-        
+        r = base_radius * random.uniform(0.7, 1.4) 
         x = int(center_x + r * math.cos(angle))
         y = int(center_y + r * math.sin(angle))
         points.append([x, y])
 
     pts = np.array(points, np.int32)
-    pts = pts.reshape((-1, 1, 2))
-
-    # Color: Brown/Dirt in BGR format
-    dirt_color = (35, 65, 95) 
-
-    # Fill the polygon
+    # Realistic Earth Brown (BGR)
+    dirt_color = (45, 75, 105) 
     cv2.fillPoly(img, [pts], dirt_color)
     
-    # Optional: Add a thin dark outline to simulate the shadow of the edge
-    cv2.polylines(img, [pts], True, (10, 10, 10), 2)
+    # ADD TEXTURE ANCHORS: Prevents the "brown blob" look
+    img = add_dirt_texture(img, pts)
     
-    # NEW: Calculate and return bbox using the new function
-    return get_bounding_box(pts)
+    cv2.polylines(img, [pts], True, (20, 20, 20), 2)
+    
+    return get_polygon_bbox(pts)
 
-def create_base_layout(w=512, h=512):
-    # 1. Base Asphalt (Grey)
-    base_color = random.randint(70, 90)
-    img = np.full((h, w, 3), (base_color, base_color, base_color), dtype=np.uint8)
+def create_base_layout(w=1024, h=1024):
+    """ Generates a randomized runway layout with shoulders and markings. """
+    left_perc, right_perc = random.uniform(0.05, 0.15), random.uniform(0.05, 0.15)
+    l_bound, r_bound = int(w * left_perc), int(w * (1.0 - right_perc))
     
-    # 2. Draw Runway Markings
-    mark_color = (210, 210, 210)
-    bar_width = w // 15
-    bar_height = h // 10
-    spacing = w // 20
+    base_val = random.randint(50, 90)
+    img = np.full((h, w, 3), (base_val, base_val, base_val), dtype=np.uint8)
     
-    # Threshold bars
-    start_x = spacing
-    for i in range(4):
-        cv2.rectangle(img, (start_x, h - bar_height), (start_x + bar_width, h), mark_color, -1)
-        end_x = w - start_x - bar_width
-        cv2.rectangle(img, (end_x, h - bar_height), (end_x + bar_width, h), mark_color, -1)
-        start_x += bar_width + spacing
+    if random.random() > 0.5:
+        shoulder_color = (random.randint(30, 60), random.randint(70, 100), random.randint(20, 40))
+    else:
+        shoulder_color = (random.randint(80, 120), random.randint(70, 100), random.randint(30, 60))
+    cv2.rectangle(img, (0, 0), (l_bound, h), shoulder_color, -1)
+    cv2.rectangle(img, (r_bound, 0), (w, h), shoulder_color, -1)
+    
+    mark_type = random.choice(['white', 'yellow', 'none'])
+    if mark_type != 'none':
+        mark_color = (210, 210, 210) if mark_type == 'white' else (180, 160, 30)
+        dash_w, dash_h = int(w * 0.03), int(h * 0.15)
+        center_x = l_bound + (r_bound - l_bound) // 2
+        cv2.rectangle(img, (center_x - dash_w//2, int(h*0.1)), (center_x + dash_w//2, int(h*0.25)), mark_color, -1)
+        cv2.rectangle(img, (center_x - dash_w//2, int(h*0.7)), (center_x + dash_w//2, int(h*0.85)), mark_color, -1)
 
-    # Centerline
-    dash_h = h // 8
-    dash_w = w // 40
-    curr_y = 0
-    while curr_y < h - bar_height - spacing:
-        cv2.rectangle(img, (w//2 - dash_w//2, curr_y), (w//2 + dash_w//2, curr_y + dash_h), mark_color, -1)
-        curr_y += dash_h * 2
-
-    # 3. Draw The Hole with Dirt
-    center_x = random.randint(w//3, 2*w//3)
-    center_y = random.randint(h//3, 2*h//3)
-    radius = random.randint(w//12, w//8)
-    
-    # Capture bbox here
-    bbox = draw_jagged_hole(img, center_x, center_y, radius)
-    
-    # 4. Add realism noise
+    img = draw_burnt_rubber(img, w, h, l_bound, r_bound)
+    bbox = draw_jagged_hole(img, l_bound, r_bound, h)
     img_gritty = add_noise_and_blur(img)
     
-    # Return both image and bbox
     return Image.fromarray(cv2.cvtColor(img_gritty, cv2.COLOR_BGR2RGB)), bbox
+
+# ==========================================
 
 def main():
     ensure_dir(OUTPUT_DIR)
-    
-    print("⏳ Loading Stable Diffusion XL Img2Img...")
-    # UPDATED: Using SDXL Base 1.0
+    vae = AutoencoderKL.from_pretrained("madebyollin/sdxl-vae-fp16-fix", torch_dtype=torch.float16)
     pipe = StableDiffusionXLImg2ImgPipeline.from_pretrained(
         "stabilityai/stable-diffusion-xl-base-1.0",
-        torch_dtype=torch.float16,
-        variant="fp16",
-        use_safetensors=True
+        vae=vae, torch_dtype=torch.float16, variant="fp16", use_safetensors=True
     ).to("cuda")
+    
+    pipe.enable_model_cpu_offload() 
+    pipe.enable_attention_slicing()
 
-    # Disable safety checker mechanism if it exists (standard SDXL pipelines usually don't have the same checker attribute, 
-    # but strictly speaking we just leave it standard or None if supported. 
-    # SDXL normally doesn't block 'dirt' textures as aggressively).
-        
-    print(f"✅ Model Loaded. Generating Potholes with Dirt (Strength: {AI_STRENGTH})...")
+    print(f"✅ Ready. Generating {NUM_IMAGES} Realistic Textured Pothole images...")
 
     for i in range(NUM_IMAGES):
         print(f"[{i+1}/{NUM_IMAGES}] Generative Step...")
+        base_image, bbox = create_base_layout(IMG_SIZE, IMG_SIZE)
         
-        # Get image and the approximate bounding box
-        base_image, bbox = create_base_layout(512, 512)
-        
-        with torch.autocast("cuda"):
+        with torch.inference_mode(), torch.autocast("cuda"):
             final_image = pipe(
                 prompt=PROMPT,
                 negative_prompt=NEGATIVE_PROMPT,
                 image=base_image,
                 strength=AI_STRENGTH,
-                num_inference_steps=40, # SDXL works well with 30-50 steps
-                guidance_scale=8.0
+                num_inference_steps=35,
+                guidance_scale=13.0
             ).images[0]
 
-        # Save Image
         filename_base = f"{OUTPUT_FILENAME_PREFIX}_{i+1:03d}"
-        img_filename = f"{filename_base}.png"
-        txt_filename = f"{filename_base}.txt"
-        
-        save_path_img = os.path.join(OUTPUT_DIR, img_filename)
-        save_path_txt = os.path.join(OUTPUT_DIR, txt_filename)
+        save_path_img = os.path.join(OUTPUT_DIR, f"{filename_base}.png")
+        save_path_txt = os.path.join(OUTPUT_DIR, f"{filename_base}.txt")
         
         final_image.save(save_path_img)
+        save_yolo_label(save_path_txt, bbox, IMG_SIZE, IMG_SIZE, YOLO_LABEL_INDEX)
         
-        # Save Label using the new function
-        width, height = final_image.size
-        save_yolo_label(save_path_txt, bbox, width, height, YOLO_LABEL_INDEX)
-        
-        print(f"Saved Image: {save_path_img}")
-        print(f"Saved Label: {save_path_txt}")
+        print(f"Saved: {filename_base}")
     
-    print("Done")
+    print(f"✅ Done. Realistic Pothole dataset ready in {OUTPUT_DIR}")
 
 if __name__ == "__main__":
     main()
