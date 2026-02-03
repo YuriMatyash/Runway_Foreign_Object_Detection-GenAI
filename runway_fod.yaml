@@ -1,4 +1,4 @@
-path: dataset/runway_dataset
+path: dataset2/runway_dataset
 
 train: images/train
 val: images/val

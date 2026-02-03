@@ -20,7 +20,7 @@ hp.MODEL_NAME = 'yolo26n.pt'
 hp.YOLO_DATA_FILE = 'runway_fod.yaml'
 
 # Path setup
-BASE_DATA_PATH = os.path.join('dataset', 'runway_dataset')
+BASE_DATA_PATH = os.path.join('dataset2', 'runway_dataset')
 TRAIN_LABELS_DIR = os.path.join(BASE_DATA_PATH, 'labels', 'train')
 
 print(f"🔧 CONFIG: Using '{hp.YOLO_DATA_FILE}'")
